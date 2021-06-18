@@ -1,0 +1,174 @@
+#!/bin/ksh
+###############################################################################
+# Purpose:  To have a common secure local/remote cluster status monitor which
+# does not use clinfo and provides a different degree of flexibility
+# than clstat - in one tool
+#
+# Description: An 'clstat' alternative monitoring script. 
+# This tool complements QHAS (LiveHA). LiveHA is really only designed to 
+# monitor one cluster. This tool is designed to remotely monitor mulitple
+# clusters (no limit).
+# It will display the internal state of each cluster mgr, plus the state of
+# each RG as reported by clRGinfo
+# Note: As per LiveHA, unprompted ssh access must be configured to each cluster node
+#          - future enhancements to follow..
+#
+# You must first create the CLUSTERfile, see vars. Format of the file is:
+# cluster:<clustername>:node1 node2 node3 etc etc
+# eg. cluster:matrix:neo trinity
+#
+# Version:  1.001
+#
+# Author:   Alex Abderrazag, IBM UK Ltd.
+###############################################################################
+
+##################VARS - can be changed #######################################
+CLUSTERfile=/alex/QHAhosts
+CGIPATH=/opt/freeware/apache/share/cgi-bin #Path to Web server cgi-bin
+CGIFILE="$CGIPATH/qhar.cgi" #CGI file to be displayed in the web browser
+OUTFILE=/tmp/.aastatus
+CDIR=/usr/es/sbin/cluster/utilities
+#VERSION=`lslpp -L |grep -i cluster.es.server.rte |awk '{print $2}'`
+#CLUSTER=`ssh root@neo odmget HACMPcluster | grep -v node |grep name | awk '{print $3}' |sed "s:\"::g"`
+SLEEPTIME=2
+
+usage()
+{
+        echo "\nUsage: qhar\n"
+}
+
+###############################################################################
+#
+#  Name: format_cgi Create the cgi (on the fly!)
+#
+format_cgi()
+{
+if [ -f $CGIFILE ]; then rm $CGIFILE; fi
+touch $CGIFILE
+ex -s $CGIFILE <<EOF
+a
+#!/usr/bin/ksh
+print "Content-type: text/html\n";
+
+echo "<!DOCTYPE HTML>"
+echo "<head>"
+echo "<TITLE>Status of HACMP clusters</TITLE>"
+print "<META HTTP-EQUIV="REFRESH" CONTENT="5">"
+echo "</head>"
+echo "<body>"
+
+########################################################### Start table ...
+echo "<table border="0" width="100%" cellpadding="10">"
+echo "<tr>"
+
+### Start section 1 ###
+echo "<td width="50%" valign="top">Cluster Status Report on `date`"
+cat << EOM1
+<PRE style="line-height:16px">
+<HR SIZE=2><font style="font-size:120%;color:black"><B>
+EOM1
+echo "</td>" ### End section
+
+### Start section 2 ###
+echo "<td width="50%" valign="top">By Alex Abderrazag (IBM UK)"
+cat << EOM2
+<PRE style="line-height:16px">
+<HR SIZE=2><font style="font-size:120%;color:black"><B>
+EOM2
+echo "</td>" ### End section
+
+########################################################### End table stuff
+echo "</tr>"
+echo "</table>"
+
+echo "</body>"
+echo "</html>"
+.
+wq
+EOF
+chmod 755 $CGIFILE
+}
+
+function work 
+{
+HANODE=$1
+ping -w 1 -c1 $HANODE > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+i=1
+ssh -o ConnectTimeout=3 -o ServerAliveInterval=3 root@$HANODE '
+
+lssrc -ls clstrmgrES |grep -i state |sed 's:Current:$HANODE:g' |sed "s:state:	:g"
+/usr/es/sbin/cluster/utilities/clfindres -s 2>/dev/null |grep -v OFFLINE
+
+' | while read A
+        do
+	if [ $i -eq 1 ]; then
+	echo $A | awk -F: '{printf "Node: %-10s %-15s\n", $1, $2 $3}'
+	let i=i+1
+	else
+        echo $A |egrep -i "(state|$HANODE)" | awk -F: '{printf "  %-15s %-20s %-10s %-10s\n", $1, $2, $3, $9}'
+	fi
+        done 
+else
+	echo "\nCan't get Status for $HANODE, check the network availability"
+fi
+}
+
+# Main
+
+format_cgi
+rm $OUTFILE*
+for clusternumber in `cat $CLUSTERfile | grep "^cluster:"  | cut -f2 -d:`
+do
+   NODES=`grep "^cluster:$clusternumber:" $CLUSTERfile | cut -f3 -d:`
+	echo "\t\tCluster: $clusternumber " >> $OUTFILE.$clusternumber
+	for MAC in $NODES
+	do
+		work $MAC 
+	done  >> $OUTFILE.$clusternumber  &
+done 
+sleep $SLEEPTIME 
+# got to wait for jobs to be completed, this time may have to be tuned depending on the no. of clusters
+cat $OUTFILE*
+# add the outfiles to the cgi
+ONE=TRUE
+for f in $OUTFILE*
+do
+# sed the file # hack as aix/sed does not have -i
+cat $f | sed 's:ONLINE:<font color="#00FF00">ONLINE<font color="#000000">:g' \
+| sed 's:ST_STABLE:<font color="#00FF00">UP \& STABLE<font color="#000000">:g' \
+| sed 's:ERROR:<font color="#FF0000">ERROR!<font color="#000000">:g' \
+| sed 's:ST_RP_FAILED:<font color="#FF0000">SCRIPT FAILURE!<font color="#000000">:g' \
+| sed 's:ST_INIT:<font color="#2B65EC">NODE DOWN<font color="#000000">:g' \
+| sed 's:SECONDARY:<font color="#2B65EC">SECONDARY<font color="#000000">:g' \
+| sed 's:ST_JOINING:<font color="#2B65EC">NODE JOINING<font color="#000000">:g' \
+| sed 's:ST_VOTING:<font color="#2B65EC">CLUSTER VOTING<font color="#000000">:g' \
+| sed 's:ST_RP_RUNNING:<font color="#2B65EC">SCRIPT PROCESSING<font color="#000000">:g' \
+| sed 's:ST_BARRIER:<font color="#2B65EC">BARRIER<font color="#000000">:g' \
+| sed 's:ST_CBARRIER:<font color="#2B65EC">CBARRIER<font color="#000000">:g' \
+| sed 's:ST_UNSTABLE:<font color="#FF0000">UNSTABLE<font color="#000000">:g' \
+|tee $f
+## end sed
+   if [ $ONE = "TRUE" ]; then
+ex -s $CGIFILE <<END
+/^EOM1
+a	  
+cat $f
+echo "-----------------------------------------------------------"
+.
+wq
+END
+   ONE=FALSE
+   else
+ex -s $CGIFILE <<END
+/^EOM2
+a
+cat $f
+echo "-----------------------------------------------------------"
+.
+wq
+END
+   ONE=TRUE
+   fi
+done > /dev/null 2>&1
+
